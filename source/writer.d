@@ -1,3 +1,4 @@
+module source.writer;
 import std.stdio;
 import std.string;
 import std.traits;
@@ -7,11 +8,12 @@ import std.exception;
 
 //import sambamba.utils.lz4;
 
-import reader;
+
+import utils.bam.reader;
 import bio.std.experimental.hts.bam.header;
 import snappy.snappy;
 
-const ubyte[] CBAM_MAGIC = ['C','B','A','M'];
+const ubyte[4] CBAM_MAGIC = ['C','B','A','M'];
 const int BATCH_SIZE = 100_000;
 const uint simple_field_size = uint.sizeof;
 
@@ -19,6 +21,7 @@ int bamToCbam(const string fn, const string ofn){
     //File outfile = File(ofn);
     BamBlobReader reader = BamBlobReader(fn); 
     File file = File(ofn, "w");
+
     FileWriter fileWriter = new FileWriter(file, reader.header);
     int recordCount = 0;
     RawReadBlob[] recordBuf;
@@ -32,10 +35,9 @@ int bamToCbam(const string fn, const string ofn){
         }
 
         recordCount += num_rows;
-
+        
         fileWriter.writeRowGroup(recordBuf, num_rows);
     }
-
     fileWriter.close();
 
     return recordCount;
@@ -64,14 +66,13 @@ class FileWriter{
     uint curOffset;
     
     this(File fn, BamHeader bamHead){
-        file.rawWrite(CBAM_MAGIC);
         file = fn;
+        file.rawWrite(CBAM_MAGIC);
         curOffset = 0;
-        BamHeader bamHeader = bamHead;         
+        bamHeader = bamHead;         
     }
     
     ~this() {
-        writeln("TEST");
         close();
     }
 
@@ -231,7 +232,7 @@ class FileWriter{
 
     void writeMeta(){
         ulong meta_offset = file.tell();
-        
+
         ubyte[] buf;
         ulong offset = 0;
         uint rowGroupsAmount = cast(uint)fileMeta.rowGroups.length; 
@@ -271,6 +272,7 @@ class FileWriter{
             (bufToWrite, cast(uint)bamHeader.refs.length, 0);
         file.rawWrite(bufToWrite);
         foreach(ref_seq; bamHeader.refs) {
+            bufToWrite.length = uint.sizeof; // introduce two buffers for different types
             uint len = cast(uint)ref_seq.name.length;
             write!(uint, Endian.littleEndian, ubyte[])
                 (bufToWrite, len, 0);
@@ -280,6 +282,7 @@ class FileWriter{
             file.rawWrite(representation(ref_seq.name));
             offset += len;
 
+            bufToWrite.length = ulong.sizeof;
             write!(ulong, Endian.littleEndian, ubyte[])
                 (bufToWrite, ref_seq.length, 0);
             file.rawWrite(bufToWrite);
@@ -297,12 +300,11 @@ class FileWriter{
         file.rawWrite(bufToWrite);
 
         bufToWrite.length = uint.sizeof;
-        write!(ulong, Endian.littleEndian, ubyte[])
+        write!(uint, Endian.littleEndian, ubyte[])
                 (bufToWrite, meta_size, 0);
         file.rawWrite(bufToWrite);
         file.rawWrite(CBAM_MAGIC);
     }
 }
-
 
 
