@@ -1,3 +1,3 @@
 # cBAM
 
-Tools for writing/reading .cBAM files.
+Tools for writing/reading cBAM files.
