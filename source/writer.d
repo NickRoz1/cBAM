@@ -2,7 +2,9 @@ module source.writer;
 import std.stdio;
 import std.string;
 import std.traits;
+import std.file;
 import std.bitmanip;
+import std.algorithm;
 import std.algorithm.iteration;
 import std.exception;
 
@@ -12,6 +14,7 @@ import std.exception;
 import utils.bam.reader;
 import bio.std.experimental.hts.bam.header;
 import snappy.snappy;
+import reader;
 
 const ubyte[4] CBAM_MAGIC = ['C','B','A','M'];
 const int BATCH_SIZE = 100_000;
@@ -230,6 +233,11 @@ class FileWriter{
         return buf.length;
     }
 
+    //       ...|fileMeta|bamHeader| meta_offset |meta_size| MAGIC |
+    //       ...|        |         |   8 bytes   | 4 bytes |4 bytes|
+    //       ...|        |         |             |         |       |
+    
+    /// Write meta to file
     void writeMeta(){
         ulong meta_offset = file.tell();
 
@@ -256,54 +264,140 @@ class FileWriter{
             std.bitmanip.write(buf, rowGroup.num_rows, offset);
             offset += uint.sizeof;
         }
-
+    
         file.rawWrite(buf);
         uint meta_size = cast(uint)buf.length;
 
-        uint text_length = cast(uint)bamHeader.text.length;
-        ubyte[] bufToWrite;
-        bufToWrite.length = uint.sizeof;
+        writeBamHeader(bamHeader, file);
 
-        write!(uint, Endian.littleEndian, ubyte[])(bufToWrite, text_length, 0);
-        file.rawWrite(bufToWrite);
-        file.rawWrite(representation(bamHeader.text));
+        buf.length = ulong.sizeof;
+        writeToFile(meta_offset, file, buf);
+        writeToFile(meta_size, file, buf);
+        file.rawWrite(CBAM_MAGIC);
+    }
 
-        write!(uint, Endian.littleEndian, ubyte[])
-            (bufToWrite, cast(uint)bamHeader.refs.length, 0);
-        file.rawWrite(bufToWrite);
-        foreach(ref_seq; bamHeader.refs) {
-            bufToWrite.length = uint.sizeof; // introduce two buffers for different types
-            uint len = cast(uint)ref_seq.name.length;
-            write!(uint, Endian.littleEndian, ubyte[])
-                (bufToWrite, len, 0);
-            file.rawWrite(bufToWrite);
-            offset += uint.sizeof;
+    unittest{
+        auto fn = getcwd() ~ "/source/tests/test1.bam";
+        
+        File testFile = File.tmpfile();
+        scope(exit) testFile.close();
+        
+        BamBlobReader reader = BamBlobReader(fn); 
 
-            file.rawWrite(representation(ref_seq.name));
-            offset += len;
+        FileWriter fileWriter = new FileWriter(testFile, reader.header);
+        int recordCount = 0;
+        RawReadBlob[] recordBuf;
+        recordBuf.length = BATCH_SIZE;
+        while(!reader.empty()){
+            uint num_rows = 0;
+            
+            while(num_rows < BATCH_SIZE && !reader.empty()){
+                recordBuf[num_rows] = reader.fetch();
+                ++num_rows;
+            }
 
-            bufToWrite.length = ulong.sizeof;
-            write!(ulong, Endian.littleEndian, ubyte[])
-                (bufToWrite, ref_seq.length, 0);
-            file.rawWrite(bufToWrite);
-            offset += ulong.sizeof;
+            recordCount += num_rows;
+            
+            fileWriter.writeRowGroup(recordBuf, num_rows);
         }
 
-        /*      ...| meta_offset |meta_size| MAGIC |
-        /       ...|   8 bytes   | 4 bytes |4 bytes|
-        /       ...|             |         |       |
-        */
+        fileWriter.writeMeta();
+        testFile.flush();
+        
+        testFile.rewind();
+        FileReader fileReader = new FileReader(testFile);
 
-        bufToWrite.length = ulong.sizeof;
-        write!(ulong, Endian.littleEndian, ubyte[])
-                (bufToWrite, meta_offset, 0);
-        file.rawWrite(bufToWrite);
+        assert(fileReader.fileMeta == fileWriter.fileMeta);
+        assert(equal!"a == b"(fileReader.bamHeader.refs, fileWriter.bamHeader.refs)); 
+        assert(fileReader.bamHeader.text == fileWriter.bamHeader.text); 
+    }
 
-        bufToWrite.length = uint.sizeof;
-        write!(uint, Endian.littleEndian, ubyte[])
-                (bufToWrite, meta_size, 0);
-        file.rawWrite(bufToWrite);
-        file.rawWrite(CBAM_MAGIC);
+    /// Writes BamHeader to the file
+    static void writeBamHeader(BamHeader bamHeader, File file){
+        pragma(inline, true);
+
+        ubyte[] buf;
+        buf.length = ulong.sizeof;
+
+        auto text_size = cast(uint)bamHeader.text.length;
+
+        writeToFile(text_size, file, buf);
+        file.rawWrite(cast(ubyte[])bamHeader.text);
+        writeToFile(cast(uint)bamHeader.refs.length, file, buf);
+
+        foreach(ref_seq; bamHeader.refs) {
+            ubyte[] ref_name = cast(ubyte[])ref_seq.name.dup;
+            auto ref_name_length = cast(uint)ref_name.length;
+
+            writeToFile(ref_name_length, file, buf);
+            file.rawWrite(ref_name);
+            writeToFile(ref_seq.length, file, buf);
+        }
+    }
+
+    unittest{
+        File testFile = File.tmpfile();
+        scope(exit) testFile.close();
+
+        auto fn = getcwd() ~ "/source/tests/test1.bam";
+        auto bamReader = BamBlobReader(fn);
+        BamHeader bamHeader = bamReader.header;
+        
+        writeBamHeader(bamHeader, testFile);
+
+        ubyte[] buf;
+        buf.length = ulong.sizeof;
+        writeToFile(cast(ulong)0, testFile, buf);
+        writeToFile(cast(uint)0, testFile, buf);
+        testFile.rawWrite(CBAM_MAGIC);
+        testFile.flush();
+        
+        testFile.rewind();
+        auto fileReader = new FileReader(testFile);
+
+        // writeln(bamHeader.refs.ptr);
+        // writeln(fileReader.bamHeader.refs.ptr);
+        assert(equal!"a == b"(fileReader.bamHeader.refs, bamHeader.refs), "Refs are corrupted");
+        assert(equal(fileReader.bamHeader.text, bamHeader.text), "Text is corrupted");
+    }
+    
+    /// Write T obj to file. buf.length must be <= ulong.sizeof
+    static void writeToFile(T)(T obj, File file, ubyte[] buf){
+        enforce(T.sizeof <= ulong.sizeof);
+        enforce(buf.length <= ulong.sizeof);
+        enforce(T.sizeof <= buf.length, "No types longer than ulong"); 
+        
+        write!(T, Endian.littleEndian, ubyte[])
+                (buf, obj, 0);
+        file.rawWrite(buf[0..T.sizeof]);
+    }
+    unittest{
+        File testFile = File.tmpfile();
+        scope(exit) testFile.close();
+
+
+        ubyte[] buf;
+        buf.length = ulong.sizeof;
+
+        const ubyte ub = 10;
+        const ushort us = 12;
+        const uint ui = 14;
+        const ulong ul = 16;
+
+        writeToFile(ub, testFile, buf);
+        writeToFile(us, testFile, buf);
+        writeToFile(ui, testFile, buf);
+        writeToFile(ul, testFile, buf);
+        testFile.flush();
+
+        testFile.rewind();
+        buf.length = ubyte.sizeof + ushort.sizeof + uint.sizeof + ulong.sizeof;
+        testFile.rawRead(buf);
+
+        assert(read!(ubyte, Endian.littleEndian, ubyte[])(buf) == ub);
+        assert(read!(ushort, Endian.littleEndian, ubyte[])(buf) == us);
+        assert(read!(uint, Endian.littleEndian, ubyte[])(buf) == ui);
+        assert(read!(ulong, Endian.littleEndian, ubyte[])(buf) == ul);
     }
 }
 
