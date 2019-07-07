@@ -2,6 +2,7 @@ module source.writer;
 import std.stdio;
 import std.string;
 import std.traits;
+import std.conv;
 import std.file;
 import std.bitmanip;
 import std.algorithm;
@@ -47,8 +48,8 @@ int bamToCbam(const string fn, const string ofn){
 }
 
 struct RowGroupMeta{
-    ulong[12] columnsOffsets;
-    ulong[12] columnsSizes;
+    ulong[EnumMembers!ColumnTypes.length] columnsOffsets;
+    ulong[EnumMembers!ColumnTypes.length] columnsSizes;
     ulong total_byte_size;
     uint num_rows;
 }
@@ -58,8 +59,8 @@ struct FileMeta{
     //uint compressionLevel;
 }
 
-// Order matters - raw qual buffer reused for raw sequence
-enum ColumnTypes {_refID, _pos, _bin_mq_nl, _flag_nc, sequence_length, _next_refID, _next_pos,
+// Order matters
+enum ColumnTypes {_refID, _pos, _blob_size, _bin_mq_nl, _flag_nc, sequence_length, _next_refID, _next_pos,
 _tlen, read_name, raw_cigar, raw_qual, raw_sequence}
 
 class FileWriter{
@@ -98,7 +99,7 @@ class FileWriter{
             if(columnType < ColumnTypes.read_name) { // Types which memory size is known
                 rowGroupMeta.columnsOffsets[columnType] = file.tell; // may be wrong, check
                 for(int i = 0; i < num_rows; ++i) {
-                    writeFieldToBuf(buf, columnType, recordBuf[i], i);
+                    writeFieldToBuf(buf, columnType, recordBuf[i], i*simple_field_size);
                 }
                 rowGroupMeta.columnsSizes[columnType] = writeColumn(buf[0..num_rows*simple_field_size]);
             }
@@ -122,6 +123,39 @@ class FileWriter{
         fileMeta.rowGroups ~= rowGroupMeta;
     }
 
+    unittest {
+        auto fn = getcwd() ~ "/source/tests/test1.bam";
+        
+        File testFile = File.tmpfile();
+        scope(exit) testFile.close();
+        
+        BamBlobReader reader = BamBlobReader(fn); 
+
+        FileWriter fileWriter = new FileWriter(testFile, reader.header);
+
+        RawReadBlob[] recordBuf;
+        recordBuf.length = BATCH_SIZE;
+
+        uint num_rows = 0;
+        
+        while(num_rows < BATCH_SIZE && !reader.empty()){
+            recordBuf[num_rows] = reader.fetch();
+            ++num_rows;
+        }
+
+        fileWriter.writeRowGroup(recordBuf, num_rows);
+        fileWriter.writeMeta();
+        testFile.flush();
+        testFile.rewind();
+        
+        FileReader fileReader = new FileReader(testFile);
+        RawReadBlob[] testBuf = fileReader.readRowGroup(0);
+
+        for(int i = 0; i < BATCH_SIZE; i++){
+            assert(recordBuf[i] == testBuf[i], "Record number " ~ to!string(i) ~ "was damaged");
+        }
+    }
+
     void writeFieldToBuf(ubyte[] buf, ColumnTypes columnType, RawReadBlob readBlob, int offset){
         pragma(inline, true);
 
@@ -133,6 +167,11 @@ class FileWriter{
             }
             case ColumnTypes._pos: {
                 std.bitmanip.write(buf, readBlob.pos, offset);
+                break;
+            }
+            case ColumnTypes._blob_size: {
+                uint blob_size = cast(int)readBlob._data.length;
+                std.bitmanip.write(buf, blob_size, offset);
                 break;
             }
             case ColumnTypes._bin_mq_nl: {
@@ -309,7 +348,7 @@ class FileWriter{
 
         assert(fileReader.fileMeta == fileWriter.fileMeta);
         assert(equal!"a == b"(fileReader.bamHeader.refs, fileWriter.bamHeader.refs)); 
-        assert(fileReader.bamHeader.text == fileWriter.bamHeader.text); 
+        assert(equal(fileReader.bamHeader.text,fileWriter.bamHeader.text)); 
     }
 
     /// Writes BamHeader to the file

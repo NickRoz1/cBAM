@@ -1,7 +1,6 @@
 /*
     New style BAM reader. This file is part of Sambamba.
     Copyright (C) 2017 Pjotr Prins <pjotr.prins@thebird.nl>
-    Modified by Nick Rozinsky
 
     Sambamba is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published
@@ -218,7 +217,7 @@ struct ReadBlob {
 struct RawReadBlob {
   RefId refid;   // -1 is invalid (BAM Spec)
   GenomePos pos; // 0 coordinate based (BAM spec)
-  private ubyte[] _data;
+  ubyte[] _data;
   uint offset_cigar=int.max, offset_seq=int.max, offset_qual=int.max;
 
   mixin ReadFlags!(_flag);
