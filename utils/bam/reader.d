@@ -319,6 +319,9 @@ struct RawReadBlob {
   @property @trusted nothrow public
   ubyte[] raw_qual()       { return _data[_qual_offset.._qual_offset + sequence_length];}
 
+  string toString() {
+    return "<** " ~ RawReadBlob.stringof ~ " (data size " ~ to!string(_data.length) ~ ") " ~ to!string(refid) ~ ":" ~ to!string(pos) ~ " length " ~ to!string(sequence_length) ~ " flags " ~ show_flags() ~ ">";
+  }
 }
 /**
    ProcessReadBlob provides a caching mechanism for ReadBlob fields. Use

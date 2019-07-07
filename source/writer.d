@@ -133,26 +133,47 @@ class FileWriter{
 
         FileWriter fileWriter = new FileWriter(testFile, reader.header);
 
+        const uint test_batch_size = 10;
         RawReadBlob[] recordBuf;
         recordBuf.length = BATCH_SIZE;
-
         uint num_rows = 0;
-        
-        while(num_rows < BATCH_SIZE && !reader.empty()){
-            recordBuf[num_rows] = reader.fetch();
-            ++num_rows;
+        while(!reader.empty()){
+            num_rows = 0;
+            
+            while(num_rows < BATCH_SIZE && !reader.empty()){
+                recordBuf[num_rows] = reader.fetch();
+                ++num_rows;
+            }
+            
+            fileWriter.writeRowGroup(recordBuf, num_rows);
         }
-
-        fileWriter.writeRowGroup(recordBuf, num_rows);
         fileWriter.writeMeta();
         testFile.flush();
         testFile.rewind();
         
         FileReader fileReader = new FileReader(testFile);
-        RawReadBlob[] testBuf = fileReader.readRowGroup(0);
-
-        for(int i = 0; i < BATCH_SIZE; i++){
-            assert(recordBuf[i] == testBuf[i], "Record number " ~ to!string(i) ~ "was damaged");
+        BamBlobReader reader2 = BamBlobReader(fn);
+        int rowGroupNum = 0;
+        while(!reader.empty()){
+            while(num_rows < BATCH_SIZE && !reader.empty()){
+                recordBuf[num_rows] = reader.fetch();
+                ++num_rows;
+            }
+            auto testBuf = fileReader.readRowGroup(rowGroupNum);
+            for(int i = 0; i < num_rows; i++){
+                assert(recordBuf[i]._bin_mq_nl == testBuf[i]._bin_mq_nl);
+                assert(recordBuf[i]._flag_nc == testBuf[i]._flag_nc);
+                assert(recordBuf[i].sequence_length == testBuf[i].sequence_length);
+                assert(recordBuf[i]._next_pos == testBuf[i]._next_pos);
+                assert(recordBuf[i]._next_refID == testBuf[i]._next_refID);
+                assert(recordBuf[i]._mapq == testBuf[i]._mapq);
+                assert(recordBuf[i]._flag == testBuf[i]._flag);
+                assert(equal(recordBuf[i].read_name, testBuf[i].read_name));
+                assert(equal(recordBuf[i].raw_cigar, testBuf[i].raw_cigar));
+                assert(equal(recordBuf[i].raw_qual, testBuf[i].raw_qual));
+                assert(equal(recordBuf[i].raw_sequence, testBuf[i].raw_sequence));
+            }
+            rowGroupNum++;
         }
     }
 

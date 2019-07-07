@@ -29,7 +29,7 @@ class FileReader {
     }
 
     RawReadBlob[] readRowGroup(int i){
-        enforce(i >= 0 && i < fileMeta.rowGroups.length, "No such rowgroup" ~ to!string(i));
+        enforce(i >= 0 && i < fileMeta.rowGroups.length, "No such rowgroup " ~ to!string(i));
 
         RowGroupMeta rowGroup = fileMeta.rowGroups[i];
         RawReadBlob[] recordBuf;
@@ -59,7 +59,7 @@ class FileReader {
         pragma(inline, true);
 
         void injectField(RawReadBlob readBlob, int offset, int size, ubyte[] data){
-            assert(data.length > offset + size, "_blob is smaller than raw data");
+            assert(readBlob._data.length >= offset + size, "_blob is smaller than raw data");
             readBlob._data[offset..offset+size] = data.dup; // Avoid dup? Ensure buf is immutable then
         }
 
