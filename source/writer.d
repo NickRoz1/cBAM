@@ -18,12 +18,12 @@ import snappy.snappy;
 import reader;
 
 const ubyte[4] CBAM_MAGIC = ['C','B','A','M'];
-const int BATCH_SIZE = 100_000;
+const int BATCH_SIZE = 1_000_000;
 const uint simple_field_size = uint.sizeof;
 
 int bamToCbam(const string fn, const string ofn){
     //File outfile = File(ofn);
-    BamBlobReader reader = BamBlobReader(fn); 
+    BamReadBlobStream reader = BamReadBlobStream(fn); 
     File file = File(ofn, "w");
 
     FileWriter fileWriter = new FileWriter(file, reader.header);
@@ -34,7 +34,13 @@ int bamToCbam(const string fn, const string ofn){
         uint num_rows = 0;
         
         while(num_rows < BATCH_SIZE && !reader.empty()){
-            recordBuf[num_rows] = reader.fetch();
+            recordBuf[num_rows] = reader.front();
+            reader.popFront();
+            ++num_rows;
+        }
+
+        if(reader.empty()){ // 
+            recordBuf[num_rows] = reader.front();
             ++num_rows;
         }
 
@@ -125,7 +131,7 @@ class FileWriter{
 
     unittest {
         auto fn = getcwd() ~ "/source/tests/test1.bam";
-        
+
         File testFile = File.tmpfile();
         scope(exit) testFile.close();
         
@@ -178,16 +184,18 @@ class FileWriter{
     }
 
     void writeFieldToBuf(ubyte[] buf, ColumnTypes columnType, RawReadBlob readBlob, int offset){
-        pragma(inline, true);
+        //pragma(inline, true);
 
 
         switch(columnType) { 
             case ColumnTypes._refID: {
-                std.bitmanip.write(buf, readBlob.refid, offset);
+                std.bitmanip.write!(int, Endian.littleEndian, ubyte[])
+                    (buf, readBlob.refid, offset);
                 break;
             }
             case ColumnTypes._pos: {
-                std.bitmanip.write(buf, readBlob.pos, offset);
+                std.bitmanip.write!(int, Endian.littleEndian, ubyte[])
+                    (buf, readBlob.pos, offset);
                 break;
             }
             case ColumnTypes._blob_size: {
@@ -225,7 +233,7 @@ class FileWriter{
 
     void writeVarFieldToBuf(ubyte[] buf, ColumnTypes columnType, RawReadBlob readBlob,
                             ref int offset){
-        pragma(inline, true);
+        //pragma(inline, true);
         //if(!(offset%10000)) writeln(offset);
 
         switch(columnType) { 
@@ -268,7 +276,7 @@ class FileWriter{
 
     /// Returns size of buffer to allocate to hold columnType field of all records
     uint calcBufSize(ColumnTypes columnType, RawReadBlob[] recordBuf){
-        pragma(inline, true);    
+        //pragma(inline, true);    
 
         switch(columnType){
             case ColumnTypes.read_name:
@@ -285,7 +293,7 @@ class FileWriter{
     }
 
     ulong writeColumn(ubyte[] column){
-        pragma(inline, true);
+        //pragma(inline, true);
 
         byte[] buf = Snappy.compress(cast(byte[])column);
         //auto buf = column;
@@ -307,7 +315,6 @@ class FileWriter{
         buf.length = int.sizeof + rowGroupsAmount * RowGroupMeta.sizeof;
         write!(int, Endian.littleEndian, ubyte[])(buf, rowGroupsAmount, offset);
         offset += int.sizeof;
-
         foreach(rowGroup; fileMeta.rowGroups) {
             foreach(columnOffset; rowGroup.columnsOffsets){
                 std.bitmanip.write(buf, columnOffset, offset);
@@ -374,7 +381,7 @@ class FileWriter{
 
     /// Writes BamHeader to the file
     static void writeBamHeader(BamHeader bamHeader, File file){
-        pragma(inline, true);
+        //pragma(inline, true);
 
         ubyte[] buf;
         buf.length = ulong.sizeof;
