@@ -130,7 +130,12 @@ void bench(string args[]){
         }
         auto fn = getcwd() ~ dir ~ args[2];
         auto ofn = getcwd() ~ dir ~ args[3];
-        writeln(bamToCbam(fn, ofn));
+        auto sw = StopWatch(AutoStart.no);
+        sw.start();
+        auto num_records = bamToCbam(fn, ofn);
+        sw.stop();
+        writeln(num_records);
+        writeln(sw.peek.total!"msecs");
         return;
     }
     if(args[1] == "bench"){

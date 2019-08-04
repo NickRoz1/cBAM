@@ -14,8 +14,10 @@ import std.algorithm.comparison;
 import std.parallelism;
 
 import source.writer;
+//import utils.bam.header;
 import bio.std.experimental.hts.bam.header;
-import bio.std.hts.bam.reader;
+
+//import bio.std.hts.bam.reader;
 import utils.bam.reader;
 import snappy.snappy;
 
@@ -29,6 +31,7 @@ class FileReader {
     this(File f) {
         file = f;
         parse_meta();
+        //if(fileMeta.rowGroups.length == 0) writeln("File is empty");
     }
 
     ~this(){
@@ -36,390 +39,222 @@ class FileReader {
         file.close();
     }
 
-    RawReadBlob[] readRowGroup(int i){
-        enforce(i >= 0 && i < fileMeta.rowGroups.length, "No such rowgroup " ~ to!string(i));
-
-        RowGroupMeta rowGroup = fileMeta.rowGroups[i];
-        RawReadBlob[] recordBuf;
-        recordBuf.length = rowGroup.num_rows;
-        
-        file.seek(rowGroup.columnsOffsets[0]);
-        ubyte[] buf;
-        buf.length = rowGroup.total_byte_size;
-        file.rawRead(buf);
-
-        
-        ulong offset = 0;
-        foreach(columnType; EnumMembers!ColumnTypes){
-            ulong compressedSize = rowGroup.columnsSizes[columnType];
-            ubyte[] plainColumn = 
-                cast(ubyte[])Snappy.uncompress(cast(byte[])buf[offset..offset + compressedSize]);
-            offset += compressedSize;
-            
-            // _blob_size should come before raw fields
-            parseColumnChunk(recordBuf, columnType, plainColumn);
-        }
-
-        return recordBuf;
+    void close(){
+        file.close();
     }
 
-    void parseColumnChunk(RawReadBlob[] recordBuf, ColumnTypes columnType, ubyte[] plainColumn){
-        //pragma(inline, true);
+    // RawReadBlob[] readRowGroup(const int i){
+    //     enforce(i >= 0 && i < fileMeta.rowGroups.length, "No such rowgroup " ~ to!string(i));
 
-        void injectField(RawReadBlob readBlob, int offset, int size, ubyte[] data){
-            assert(readBlob._data.length >= offset + size, "_blob is smaller than raw data");
-            readBlob._data[offset..offset+size] = data.dup; // Avoid dup? Ensure buf is immutable then
-        }
+    //     void injectField(ref RawReadBlob readBlob, int offset, int size, ref ubyte[] data){
+    //         assert(readBlob._data.length >= offset + size, "_blob is smaller than raw data");
+    //         readBlob._data[offset..offset+size] = data; // dup? Ensure buf is immutable then
+    //     }
 
-        switch(columnType){
-                case ColumnTypes._refID: {
-                    foreach(ref record; recordBuf){
-                        record.refid = read!(int, Endian.littleEndian, ubyte[])
-                            (plainColumn);
-                    }
-                    break;
-                }
-                case ColumnTypes._pos: {
-                    foreach(ref record; recordBuf){
-                        record.pos = read!(uint, Endian.littleEndian, ubyte[])
-                            (plainColumn);
-                    }
-                    break;
-                }
-                case ColumnTypes._blob_size: {
-                    foreach(ref record; recordBuf){
-                        record._data.length = read!(uint, Endian.bigEndian, ubyte[])
-                            (plainColumn);
-                    }
-                    break;
-                }
-                case ColumnTypes._bin_mq_nl: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+simple_field_size];
-                        injectField(record, Offset.bin_mq_nl, simple_field_size, data);
-                        columnOffset += simple_field_size;
-                    }
-                    break;
-                }
-                case ColumnTypes._flag_nc: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+simple_field_size];
-                        injectField(record, Offset.flag_nc, simple_field_size, data);
-                        columnOffset += simple_field_size;
-                    }
-                    break;
-                }
-                case ColumnTypes.sequence_length: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+simple_field_size];
-                        injectField(record, Offset.l_seq, simple_field_size, data);
-                        columnOffset += simple_field_size;
-                    }
-                    break;
-                }
-                case ColumnTypes._next_refID: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+simple_field_size];
-                        injectField(record, Offset.next_refID, simple_field_size, data);
-                        columnOffset += simple_field_size;
-                    }
-                    break;
-                }
-                case ColumnTypes._next_pos: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+simple_field_size];
-                        injectField(record, Offset.next_pos, simple_field_size, data);
-                        columnOffset += simple_field_size;
-                    }
-                    break;
-                }
-                case ColumnTypes._tlen: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+simple_field_size];
-                        injectField(record, Offset.tlen, simple_field_size, data);
-                        columnOffset += simple_field_size;
-                    }
-                    break;
-                }
-                case ColumnTypes.read_name: {
-                    size_t columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        int len = peek!(int, Endian.littleEndian, ubyte[])
-                            (plainColumn, &columnOffset);
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+len];
-                        injectField(record, Offset.read_name, len, data);
-                        columnOffset += len;
-                    }
-                    break;
-                }
-                case ColumnTypes.raw_cigar: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        int len = peek!(int, Endian.littleEndian, ubyte[])
-                            (plainColumn, &columnOffset);
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+len];
-                        injectField(record, record._cigar_offset, len, data);
-                        columnOffset += len;
-                    }
-                    break;
-                }
-                case ColumnTypes.raw_qual: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        int len = peek!(int, Endian.littleEndian, ubyte[])
-                            (plainColumn, &columnOffset);
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+len];
-                        injectField(record, record._qual_offset, len, data);
-                        columnOffset += len;
-                    }
-                    break;
-                }
-                case ColumnTypes.raw_sequence: {
-                    ulong columnOffset = 0;
-                    ubyte[] data;
-                    foreach(ref record; recordBuf){
-                        int len = peek!(int, Endian.littleEndian, ubyte[])
-                            (plainColumn, &columnOffset);
-                        data = cast(ubyte[])plainColumn[columnOffset..columnOffset+len];
-                        injectField(record, record._seq_offset, len, data);
-                        columnOffset += len;
-                    }
-                    break;
-                }
-                default: assert(false, "No such type exists");
-            }
-    }
+    //     static int localOff()
+
+    //     void injectField(T) 
+    //         if (is(T==Column))
+    //         (RawReadBlob[] readsBuf, T col){
+    //         static if(is(T == Column!Args, Args...)){
+    //             static if(is(Args[0] == ubyte[])){
+    //                 alias bamField = Args[1];
+    //                 static if(bamField == bamFields.read_name)
+    //                     int localOffset = 
+    //                 else static if(bamField == bamFields.raw_cigar)
+
+    //                 else static if(bamField == bamFields.raw_sequence)
+    //                 else static if(bamField == bamFields.raw_qual)
+    //             }
+    //             int localOffset = 
+    //         }
+    //     }
+    //     auto sizesCol = getColumn!(int[], bamFields.blob_size).getChunk(i);
+        
+    //     RawReadBlob[] readsBuf;
+    //     readsBuf.length = sizesCol.length;
+
+    //     foreach(i, ref elem; readsBuf){
+    //         elem._data.length = sizesCol[i];
+    //     }
+
+    //     static foreach(member; EnumMembers!bamFields){
+    //         static if(member == bamFields.read_name ||
+    //                   member == bamFields.raw_qual  ||
+    //                   member == bamFields.raw_sequence ||
+    //                   member == bamFields.cigar){
+    //             auto col = getColumn!(ubyte[][], member, true).getChunk(i);
+    //             injectField(typeof(col))(readsBuf, col);
+    //         }
+    //         else static if(member != bamFields.mapq && member != bamFields.blob_size){
+    //             auto col = getColumn!(int[], member, true).getChunk(i);
+    //         }
+    //     }
+    // }
+
+
 
     enum bamFields{refID, pos, bin, mapq, flag, nextRefID,
-        nextPos, tlen, read_name, cigar, raw_qual, raw_sequence}
+        nextPos, tlen, read_name, cigar, raw_sequence, raw_qual, blob_size}
 
-    T getColumn(T)(bamFields bamField){
-        uint num_rows = reduce!((a,b) => a + b)(map!(row_group => row_group.num_rows)
+    enum bamfToCbamf = [
+        bamFields.refID         : ColumnTypes._refID,
+        bamFields.pos           : ColumnTypes._pos,
+        bamFields.bin           : ColumnTypes._bin_mq_nl,
+        bamFields.mapq          : ColumnTypes._bin_mq_nl,
+        bamFields.flag          : ColumnTypes._flag_nc,
+        bamFields.nextRefID     : ColumnTypes._next_refID,
+        bamFields.nextPos       : ColumnTypes._next_pos,
+        bamFields.tlen          : ColumnTypes._tlen,
+        bamFields.read_name     : ColumnTypes.read_name,
+        bamFields.cigar         : ColumnTypes.raw_cigar,
+        bamFields.raw_qual      : ColumnTypes.raw_qual,
+        bamFields.raw_sequence  : ColumnTypes.raw_sequence,
+        bamFields.blob_size     : ColumnTypes._blob_size
+    ];
+
+    Column!(T, bfield) getColumn(T, bamFields bfield)(){
+        return Column!(T, bfield)(fileMeta, file);
+    }
+
+    Column!(T, bfield, isRaw) getColumn(T, bamFields bfield, bool isRaw)(){
+        return Column!(T, bfield, isRaw)(fileMeta, file);
+    }
+
+    struct Column(T, bamFields bfield, bool isRaw = false)
+        if(is(T == ubyte[][]) || is(T == int[]) 
+        || is(T == short[])   || is(T == ubyte[])) {
+            
+        this(FileMeta meta, File f){
+            fileMeta = meta;
+            static if(isRaw && !is(T == ubyte[][])){
+                buffer.length = T.sizeof*fileMeta.rowGroups[0].num_rows;
+            }
+            else{
+                buffer.length = fileMeta.rowGroups[0].num_rows;
+            }
+            file = f;
+        }
+
+        static if (!isRaw)
+        public T fullColumn(){
+            uint num_rows = reduce!((a,b) => a + b)(map!(row_group => row_group.num_rows)
                             (fileMeta.rowGroups));
-        
-        static if(is(T==int[])){
-            switch(bamField){
-                case bamFields.refID:{
-                    byte[] buf = getRawColumn(ColumnTypes._refID);
-                    T column;
-                    foreach(i, ref elem; column){
-                        column[i] = *(cast( int*)(buf.ptr + int.sizeof * i));
-                    }
-                    return column;
-                }
-                case bamFields.pos:{
-                    byte[] buf = getRawColumn(ColumnTypes._pos);
-                    T column;
-                    column.length = num_rows;
-                    foreach(i, ref elem; column){
-                    //foreach(i, ref elem; taskPool.parallel(column, 1_000_000)){
-                        column[i] = *(cast( int*)(buf.ptr + int.sizeof * i));
-                    }
-                    return column;
-                }
-                case bamFields.nextRefID:{
-                    byte[] buf = getRawColumn(ColumnTypes._next_refID);
-                    T column;
-                    foreach(i, ref elem; column){
-                        column[i] = *(cast( int*)(buf.ptr + int.sizeof * i));
-                    }
-                    return column;
-                }
-                case bamFields.nextPos:{
-                    byte[] buf = getRawColumn(ColumnTypes._next_pos);
-                    T column;
-                    foreach(i, ref elem; column){
-                        column[i] = *(cast( int*)(buf.ptr + int.sizeof * i));
-                    }
-                    return column;
-                }
-                case bamFields.tlen:{
-                    byte[] buf = getRawColumn(ColumnTypes._tlen);
-                    T column;
-                    foreach(i, ref elem; column){
-                        column[i] = *(cast( int*)(buf.ptr + int.sizeof * i));
-                    }
-                    return column;
-                }
-                default:{
-                    assert(false, "This field is hold in other type");
-                }
-            }
-        }
-        else static if(is(T==short[])){
-            switch(bamField){
-                case bamFields.bin:{
-                    byte[] buf = getRawColumn(ColumnTypes._bin_mq_nl);
-                    T column;
-                    column.reserve(num_rows);
-                    while(buf.length != 0){
-                        buf = buf[ushort.sizeof..$];
-                        column ~= read!(ElementType!T, Endian.littleEndian, byte[])(buf);
-                    }
-                    return column;
-                }
-                case bamFields.flag:{
-                    byte[] buf = getRawColumn(ColumnTypes._flag_nc);
-                    T column;
-                    column.reserve(num_rows);
-                    while(buf.length != 0){
-                        buf = buf[ushort.sizeof..$];
-                        column ~= read!(ElementType!T, Endian.littleEndian, byte[])(buf);
-                    }
-                    return column;
-                }
-                default:{
-                    assert(false, "This field is hold in other type");
-                }
-            }
-        }
-        else static if(is(T==ubyte[])){
-            assert(bamField == bamFields.mapq, "This field is hold in other type");
-            byte[] buf = getRawColumn(ColumnTypes._bin_mq_nl);
+
             T column;
-            column.reserve(num_rows);
-            while(buf.length != 0){
-                buf = buf[ubyte.sizeof..$];
-                column ~= read!(ElementType!T, Endian.littleEndian, byte[])(buf);
-                buf = buf[ushort.sizeof..$];
+            column.length = num_rows;
+
+            foreach(i, elem; this){
+                column[i] = elem;
             }
+
             return column;
         }
-        else static if(is(T==ubyte[][])){
-            switch(bamField){
-                case bamFields.read_name:{
-                    ubyte[] buf = cast(ubyte[])getRawColumn(ColumnTypes.read_name);
-                    T column;
-                    column.reserve(num_rows);
-                    size_t offset = 0;
-                    while(offset != buf.length){
-                        int length = 
-                            peek!(int, Endian.littleEndian, ubyte[])(buf, &offset);
-                        column ~= buf[offset..offset+length];
-                        offset += length;
-                    }
-                    return column;
+
+        private static ElementType!T parse(ref byte[] bytes){
+            // variable size fields require additional parsing step
+            static if(is(ElementType!T==ubyte[])){
+                auto length = *(cast( int*)(bytes.ptr));
+                ElementType!T value = cast(ubyte[])bytes[int.sizeof..int.sizeof+length];//.dup;
+                bytes = bytes[int.sizeof+length..$];
+            }
+            else{
+                // To parse row groups
+                static if(isRaw){
+                    int localOffset = 0;
                 }
-                case bamFields.cigar:{
-                    ubyte[] buf = cast(ubyte[])getRawColumn(ColumnTypes.raw_cigar);
-                    T column;
-                    column.reserve(num_rows);
-                    size_t offset = 0;
-                    while(offset != buf.length){
-                        int length = 
-                            peek!(int, Endian.littleEndian, ubyte[])(buf, &offset);
-                        column ~= buf[offset..offset+length];
-                        offset += length;
-                    }
-                    return column;
+                else static if(bfield == bamFields.bin 
+                        || bfield == bamFields.flag){
+                    int localOffset = 2;  
                 }
-                case bamFields.raw_qual:{
-                    ubyte[] buf = cast(ubyte[])getRawColumn(ColumnTypes.raw_qual);
-                    T column;
-                    column.reserve(num_rows);
-                    size_t offset = 0;
-                    while(offset != buf.length){
-                        int length = 
-                            peek!(int, Endian.littleEndian, ubyte[])(buf, &offset);
-                        column ~= buf[offset..offset+length];
-                        offset += length;
-                    }
-                    return column;
+                else static if(bfield == bamFields.mapq){
+                    int localOffset = 1;
                 }
-                case bamFields.raw_sequence:{
-                    ubyte[] buf = cast(ubyte[])getRawColumn(ColumnTypes.raw_sequence);
-                    T column;
-                    column.reserve(num_rows);
-                    size_t offset = 0;
-                    while(offset != buf.length){
-                        int length = 
-                            peek!(int, Endian.littleEndian, ubyte[])(buf, &offset);
-                        column ~= buf[offset..offset+length];
-                        offset += length;
-                    }
-                    return column;
+                else{
+                    int localOffset = 0;
                 }
-                default:{
-                    assert(false, "This field is hold in other type");
+                ElementType!T value = *(cast( ElementType!T*)(bytes.ptr + localOffset));
+                bytes = bytes[int.sizeof..$]; // fields smaller than int packed into one 
+                //writeln(localOffset);
+            }
+            return value;
+        }
+        
+        static if(!isRaw)
+        int opApply(int delegate(ElementType!T) dg){
+            int result = 0;
+            foreach(rowGroup; fileMeta.rowGroups){
+                buffer.length = rowGroup.num_rows;
+                fetchBuffer(rowGroup);
+                foreach(ref ElementType!T elem; buffer){
+                    result = dg(elem);
+                    if(result) break;
+                }
+            }
+            
+            return result;
+        }
+
+        static if(!isRaw)
+        int opApply(int delegate(ref size_t i, ElementType!T) dg){
+            int result = 0;
+            size_t i = 0;
+            foreach(rowGroup; fileMeta.rowGroups){
+                buffer.length = rowGroup.num_rows;
+                fetchBuffer(rowGroup);
+                foreach(ElementType!T elem; buffer){
+                    result = dg(i, elem);
+                    ++i;
+                    if(result) break;
+                }
+            }
+
+            return result;
+        }
+
+        private void fetchBuffer(RowGroupMeta rowGroup){
+            byte[] rawBuffer;
+
+            ulong size = rowGroup.columnsSizes[columnType];
+            rawBuffer.length = size;
+            
+            file.seek(rowGroup.columnsOffsets[columnType]);
+            file.rawRead(rawBuffer);
+            auto plainBuffer = Snappy.uncompress(rawBuffer);
+
+            static if(isRaw && !is(T==ubyte[][])){
+                buffer = plainBuffer;
+            }
+            else{
+                foreach(i, ref elem; buffer){
+                    elem = parse(plainBuffer);
                 }
             }
         }
 
-    }
-
-    
-    
-    byte[] getRawColumn(ColumnTypes columnType){
-        ulong raw_column_size = reduce!((a,b) => a + b)
-                (map!(row_group => row_group.columnsSizes[columnType])
-                    (fileMeta.rowGroups));
-
-        ulong max_column_chunk = maxElement(map!(row_group => row_group.columnsSizes[columnType])
-                    (fileMeta.rowGroups));
-        byte[] buffer;
-        buffer.length = raw_column_size;
-        //buffer.reserve(max_column_chunk);
-
+        static if(!isRaw)
+        T getChunk(int i) {
+            fetchBuffer(fileMeta.rowGroups[i]); 
+            return buffer; 
+        }
+        else
+        ubyte[] getChunk(int i) {
+            fetchBuffer(fileMeta.rowGroups[i]); 
+            return buffer; 
+        }
         
-        // Dangerous, may produce wrong results. Investigate
-        // auto ok = snappy_uncompressed_length(buffer.ptr, raw_column_size, &prediction);
-        // enforce(ok == snappy_status.SNAPPY_OK);
-        // byte[] outBuf;
-        // writeln(prediction);
-
-        ulong offset = 0;
-        foreach(rowGroup; fileMeta.rowGroups){
-            file.seek(rowGroup.columnsOffsets[columnType]);
-            ulong size = rowGroup.columnsSizes[columnType];
-            file.rawRead(buffer[offset..offset+size]);
-            offset += size;
-            //outBuf ~= Snappy.uncompress(buffer);
-        }
-        size_t prediction;
-        ulong offset1 = 0;
-        foreach(rowGroup; fileMeta.rowGroups){
-            size_t temp;
-            auto tempSlice = buffer[offset1..offset1+rowGroup.columnsSizes[columnType]];
-            snappy_uncompressed_length(tempSlice.ptr, tempSlice.length, &temp);
-            prediction += temp;
-        }
-        //writeln(prediction);
-        //auto ok = snappy_uncompressed_length(buffer.ptr, raw_column_size, &prediction);
-        //enforce(ok == snappy_status.SNAPPY_OK);
-        byte[] outBuf;
-        //writeln(prediction);
-        outBuf.reserve(prediction);
-        //writeln("CAPACITY");
-        //writeln(outBuf.capacity());
-
-        foreach(rowGroup; fileMeta.rowGroups){
-            outBuf ~= Snappy.uncompress(buffer[0..rowGroup.columnsSizes[columnType]]);
-            buffer = buffer[rowGroup.columnsSizes[columnType]..$];
-            //writeln(outBuf.capacity());
-            //writeln(buffer.capacity());
-        }
-
-        //writeln("TEST");
-        //writeln(outBuf.length);
-
-        return outBuf;
+        private: 
+            static if(isRaw){
+                ubyte[] buffer;
+            }
+            else{
+                T buffer;
+            }
+            const ColumnTypes columnType = bamfToCbamf[bfield];
+            FileMeta fileMeta;
+            File file;
     }
-
+    
     unittest{
         auto fn1 = getcwd() ~ "/source/tests/test3.cbam";
         auto fn2 = getcwd() ~ "/source/tests/test1.bam";
@@ -427,26 +262,29 @@ class FileReader {
         File file = File(fn1, "r");
         FileReader fileR = new FileReader(file);
 
-        int[]   CBAMpos =  fileR.getColumn!(int[])(bamFields.pos);
-        short[] CBAMflag = fileR.getColumn!(short[])(bamFields.flag);
-        ubyte[] CBAMmapq = fileR.getColumn!(ubyte[])(bamFields.mapq);
-        ubyte[][] CBAMqual = fileR.getColumn!(ubyte[][])(bamFields.raw_qual);
+        auto CBAMpos  = fileR.getColumn!(int[], bamFields.pos);
+        auto CBAMflag = fileR.getColumn!(short[], bamFields.flag);
+        auto CBAMmapq = fileR.getColumn!(ubyte[], bamFields.mapq);
+        auto CBAMqual = fileR.getColumn!(ubyte[][], bamFields.raw_qual);
+
+        auto posCol  = CBAMpos.fullColumn();
+        auto flagCol = CBAMflag.fullColumn();
+        auto mapqCol = CBAMmapq.fullColumn();
+        auto qualCol = CBAMqual.fullColumn();
 
         BamReadBlobStream reader = BamReadBlobStream(fn2);
-        int[] BAMdata;
         int i = 0;
         while(!reader.empty()){
             auto temp = reader.front();
 
-            assert(CBAMpos[i] == temp.pos);
-            assert(CBAMflag[i] == temp._flag);
-            assert(CBAMmapq[i] == temp._mapq);
-            assert(equal(CBAMqual[i], temp.raw_qual));
-
+            assert(posCol[i] == temp.pos);
+            assert(flagCol[i] == temp._flag);
+            assert(mapqCol[i] == temp._mapq);
+            assert(equal(qualCol[i], temp.raw_qual));
             reader.popFront();
             ++i;
         }
-        assert(CBAMpos.length == i);
+        assert(posCol.length-1 == i);
     }
 
 
