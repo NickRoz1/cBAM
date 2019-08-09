@@ -19,6 +19,7 @@ while(!bamReader.empty()){
         bamReader.popFront();
 }
 fileWriter.addRecord(bamReader.front());
+
 fileWriter.close();
 ```
 ## Reader
