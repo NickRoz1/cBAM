@@ -8,49 +8,34 @@ import std.bitmanip;
 import std.algorithm;
 import std.algorithm.iteration;
 import std.exception;
+import reader;
 
 //import sambamba.utils.lz4;
 
 
 import utils.bam.reader;
+//import utils.bam.header;
 import bio.std.experimental.hts.bam.header;
+
 import snappy.snappy;
-import reader;
+
 
 const ubyte[4] CBAM_MAGIC = ['C','B','A','M'];
-const int BATCH_SIZE = 1_000_000;
 const uint simple_field_size = uint.sizeof;
 
 int bamToCbam(const string fn, const string ofn){
-    //File outfile = File(ofn);
     BamReadBlobStream reader = BamReadBlobStream(fn); 
     File file = File(ofn, "w");
-
     FileWriter fileWriter = new FileWriter(file, reader.header);
-    int recordCount = 0;
-    RawReadBlob[] recordBuf;
-    recordBuf.length = BATCH_SIZE;
+
     while(!reader.empty()){
-        uint num_rows = 0;
-        
-        while(num_rows < BATCH_SIZE && !reader.empty()){
-            recordBuf[num_rows] = reader.front();
-            reader.popFront();
-            ++num_rows;
-        }
-
-        if(reader.empty()){ // 
-            recordBuf[num_rows] = reader.front();
-            ++num_rows;
-        }
-
-        recordCount += num_rows;
-        
-        fileWriter.writeRowGroup(recordBuf, num_rows);
+        fileWriter.addRecord(reader.front());
+        reader.popFront();
     }
+    fileWriter.addRecord(reader.front());
     fileWriter.close();
 
-    return recordCount;
+    return fileWriter.totalRows;
 }
 
 struct RowGroupMeta{
@@ -62,24 +47,34 @@ struct RowGroupMeta{
 
 struct FileMeta{
     RowGroupMeta[] rowGroups;
-    //uint compressionLevel;
 }
 
 // Order matters
-enum ColumnTypes {_refID, _pos, _blob_size, _bin_mq_nl, _flag_nc, sequence_length, _next_refID, _next_pos,
-_tlen, read_name, raw_cigar, raw_qual, raw_sequence}
+enum ColumnTypes {_refID, _pos, _blob_size, _bin_mq_nl,
+     _flag_nc, sequence_length, _next_refID, _next_pos,
+    _tlen, read_name, raw_cigar, raw_sequence, raw_qual}
 
 class FileWriter{
     File file;
     FileMeta fileMeta;
     BamHeader bamHeader;
-    uint curOffset;
+    int rowGroupSize;
+    RawReadBlob[] buffer;
+    int numRows;
+    int totalRows;
     
     this(File fn, BamHeader bamHead){
+        this(fn, bamHeader, 1_00_000);     
+    }
+
+    this(File fn, BamHeader bamHead, int groupSize){
+        rowGroupSize = groupSize;
+        buffer.length = rowGroupSize;
         file = fn;
         file.rawWrite(CBAM_MAGIC);
-        curOffset = 0;
-        bamHeader = bamHead;         
+        bamHeader = bamHead;  
+        numRows = 0;
+        totalRows = 0;
     }
     
     ~this() {
@@ -88,14 +83,29 @@ class FileWriter{
 
     void close(){
         if(!file.isOpen) return;
+        flushBuf();
         writeMeta();
         file.close(); 
     }
+
+    void addRecord(RawReadBlob record){ // blob is struct, passed by value
+        if(numRows == rowGroupSize){
+            flushBuf();
+            numRows = 0;
+        }
+        buffer[numRows++] = record;
+    }
+
+    void flushBuf(){
+        writeRowGroup(buffer, numRows);
+    }
+
     void writeRowGroup(RawReadBlob[] recordBuf, uint num_rows){
         assert(file.isOpen());
         
         RowGroupMeta rowGroupMeta;
         rowGroupMeta.num_rows = num_rows;
+        totalRows += numRows;
 
         uint total_size = 0;
         ubyte[] buf;
@@ -103,16 +113,14 @@ class FileWriter{
 
         foreach(columnType; EnumMembers!ColumnTypes) {
             if(columnType < ColumnTypes.read_name) { // Types which memory size is known
-                rowGroupMeta.columnsOffsets[columnType] = file.tell; // may be wrong, check
+                rowGroupMeta.columnsOffsets[columnType] = file.tell(); // may be wrong, check
                 for(int i = 0; i < num_rows; ++i) {
                     writeFieldToBuf(buf, columnType, recordBuf[i], i*simple_field_size);
                 }
                 rowGroupMeta.columnsSizes[columnType] = writeColumn(buf[0..num_rows*simple_field_size]);
             }
             else {
-                if(columnType != ColumnTypes.raw_sequence) { // raw_qual >= raw_sequence
-                    buf.length = calcBufSize(columnType, recordBuf)+int.sizeof*num_rows;
-                }
+                buf.length = calcBufSize(columnType, recordBuf)+int.sizeof*num_rows;
                 rowGroupMeta.columnsOffsets[columnType] = file.tell();
 
                 int currentPos = 0;
@@ -122,7 +130,6 @@ class FileWriter{
                 
                 rowGroupMeta.columnsSizes[columnType] = writeColumn(buf[0..currentPos]);
             }
-            //writeln(columnType);
         }
 
         rowGroupMeta.total_byte_size = reduce!((a,b) => a + b)(rowGroupMeta.columnsSizes);
@@ -137,21 +144,12 @@ class FileWriter{
         
         BamBlobReader reader = BamBlobReader(fn); 
 
-        FileWriter fileWriter = new FileWriter(testFile, reader.header);
+        const int BATCH_SIZE = 1_00_000;
+        FileWriter fileWriter = new FileWriter(testFile, reader.header, BATCH_SIZE);
 
-        const uint test_batch_size = 10;
-        RawReadBlob[] recordBuf;
-        recordBuf.length = BATCH_SIZE;
-        uint num_rows = 0;
+
         while(!reader.empty()){
-            num_rows = 0;
-            
-            while(num_rows < BATCH_SIZE && !reader.empty()){
-                recordBuf[num_rows] = reader.fetch();
-                ++num_rows;
-            }
-            
-            fileWriter.writeRowGroup(recordBuf, num_rows);
+            fileWriter.addRecord(reader.fetch());
         }
         fileWriter.writeMeta();
         testFile.flush();
@@ -160,10 +158,12 @@ class FileWriter{
         FileReader fileReader = new FileReader(testFile);
         BamBlobReader reader2 = BamBlobReader(fn);
         int rowGroupNum = 0;
+        RawReadBlob[] recordBuf;
+        recordBuf.length = BATCH_SIZE;
+        int num_rows = 0;
         while(!reader.empty()){
             while(num_rows < BATCH_SIZE && !reader.empty()){
-                recordBuf[num_rows] = reader.fetch();
-                ++num_rows;
+                recordBuf[num_rows++] = reader.fetch();
             }
             auto testBuf = fileReader.readRowGroup(rowGroupNum);
             for(int i = 0; i < num_rows; i++){
@@ -258,6 +258,7 @@ class FileWriter{
                 write!(int, Endian.littleEndian, ubyte[])(buf, fieldSize, offset);
                 offset += int.sizeof;
                 buf[offset..offset + readBlob.raw_qual.length] = readBlob.raw_qual;
+                assert(buf[offset..offset + readBlob.raw_qual.length] == readBlob.raw_qual);
                 offset += readBlob.raw_qual.length;
                 break;
             }
@@ -285,7 +286,7 @@ class FileWriter{
                 return cast(uint)(
                     int.sizeof*reduce!((a,b) => a + b)(map!(a => a._n_cigar_op)(recordBuf)));
             case ColumnTypes.raw_sequence:
-                return (reduce!((a,b) => a + b)(map!(a => a.sequence_length)(recordBuf))+1)/2;
+                return reduce!((a,b) => a + b)(map!(a => (a.sequence_length + 1)/2)(recordBuf));
             case ColumnTypes.raw_qual:
                 return reduce!((a,b) => a + b)(map!(a => a.sequence_length)(recordBuf));
             default: { assert(false); }
@@ -296,7 +297,6 @@ class FileWriter{
         //pragma(inline, true);
 
         byte[] buf = Snappy.compress(cast(byte[])column);
-        //auto buf = column;
         file.rawWrite(buf);
         return buf.length;
     }
@@ -352,20 +352,8 @@ class FileWriter{
         BamBlobReader reader = BamBlobReader(fn); 
 
         FileWriter fileWriter = new FileWriter(testFile, reader.header);
-        int recordCount = 0;
-        RawReadBlob[] recordBuf;
-        recordBuf.length = BATCH_SIZE;
         while(!reader.empty()){
-            uint num_rows = 0;
-            
-            while(num_rows < BATCH_SIZE && !reader.empty()){
-                recordBuf[num_rows] = reader.fetch();
-                ++num_rows;
-            }
-
-            recordCount += num_rows;
-            
-            fileWriter.writeRowGroup(recordBuf, num_rows);
+            fileWriter.addRecord(reader.fetch());
         }
 
         fileWriter.writeMeta();
