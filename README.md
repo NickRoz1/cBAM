@@ -64,6 +64,8 @@ RawReadBlob[] rowGroup;
 
 // Get rowgroup
 rowGroup = fileReader.readRowGroup(groupNumber);
+
+fileReader.close();
 ```
 
 
