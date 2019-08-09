@@ -176,13 +176,15 @@ class FileReader {
             file = f;
         }
 
+        public @property long size(){
+            return reduce!((a,b) => a + b)(map!(row_group => row_group.num_rows)
+                            (fileMeta.rowGroups));
+        }
+
         
         public T fullColumn(){
-            uint num_rows = reduce!((a,b) => a + b)(map!(row_group => row_group.num_rows)
-                            (fileMeta.rowGroups));
-
             T column;
-            column.length = num_rows;
+            column.length = this.size;
 
             foreach(i, elem; this){
                 column[i] = elem;
