@@ -12,6 +12,7 @@ import std.algorithm.searching;
 import std.datetime.stopwatch;
 import std.algorithm.comparison;
 import std.parallelism;
+import std.meta;
 
 import source.writer;
 import bio.std.experimental.hts.bam.header;
@@ -24,21 +25,22 @@ class FileReader {
     File file;
     FileMeta fileMeta;
     BamHeader bamHeader;
-
+    ///
     this(File f) {
         file = f;
         parse_meta();
     }
 
     ~this(){
-        if(file.isOpen) return;
+        if(!file.isOpen()) return;
         file.close();
     }
-
+    ///
     void close(){
         file.close();
     }
 
+    /// Maps column types to Offsets
     enum colTypeToOff = [
         "_bin_mq_nl"         : "Offset.bin_mq_nl",
         "_flag_nc"           : "Offset.flag_nc",
@@ -52,6 +54,8 @@ class FileReader {
         "raw_qual"           : "_qual_offset"
     ];
 
+
+    /// Returns array of RawReadBlobs representing rowGroup.
     RawReadBlob[] readRowGroup(const int i){
         enforce(i >= 0 && i < fileMeta.rowGroups.length, "No such rowgroup " ~ to!string(i));
 
@@ -60,6 +64,7 @@ class FileReader {
         RawReadBlob[] readsBuf;
         readsBuf.length = sizesCol.length;
 
+        /// Preallocates blob size to avoid subsequent allocations
         foreach(blob_n, ref elem; readsBuf){
             elem._data.length = sizesCol[blob_n];
         }
@@ -105,10 +110,11 @@ class FileReader {
         return readsBuf;
     }
 
+    /// enum of BAM fields held in CBAM file
     enum bamFields{refID, pos, bin, mapq, flag, nextRefID,
         nextPos, tlen, read_name, cigar, raw_sequence, raw_qual, blob_size}
 
-
+    /// Maps BAM fields to Columns (some BAM fields packed together)
     enum bamfToCbamf = [
         bamFields.refID         : ColumnTypes._refID,
         bamFields.pos           : ColumnTypes._pos,
@@ -125,6 +131,113 @@ class FileReader {
         bamFields.blob_size     : ColumnTypes._blob_size
     ];
 
+    /**
+        Generates Column given wanted bamField.
+
+        Alias `colT` contains the type
+
+        Example:
+        ---
+        FileReader cbam_reader = new FileReader(file);
+
+        cbam_reader.getColType!(bfield).colT(fileMeta, file);
+        ---
+    */
+
+    template getColType(bamFields bfield){
+        static if(bfield == bamFields.refID ||
+                  bfield == bamFields.pos   ||
+                  bfield == bamFields.nextRefID ||
+                  bfield == bamFields.nextPos ||
+                  bfield == bamFields.tlen ||
+                  bfield == bamFields.blob_size){
+                    alias colT = Column!(int[], bfield);
+                }
+        else static if(bfield == bamFields.bin  ||
+                  bfield == bamFields.flag){
+                    alias colT = Column!(short[], bfield);
+                }
+        else static if(bfield == bamFields.mapq)
+                    alias colT = Column!(ubyte[], bfield);
+        else static if(bfield == bamFields.read_name ||
+                  bfield == bamFields.cigar     ||
+                  bfield == bamFields.raw_qual  ||
+                  bfield == bamFields.raw_sequence){
+                    alias colT = Column!(ubyte[][], bfield);
+        }
+        else static assert(false, "This BAM field is not supported yet.");
+    }
+
+    struct VariadicReader(Cols...) if(Cols.length > 0){
+        
+        template genSeq(Args...){
+            static if (Args.length == 0){
+                alias genSeq = AliasSeq!();
+            }
+            else{
+                alias genSeq = AliasSeq!(getColType!(Args[0]).colT, genSeq!(Args[1..$]));
+            }
+        }
+        template extractType(Args...){
+            static if (Args.length == 0){
+                alias extractType = AliasSeq!();
+            }
+            else{
+                alias extractType = AliasSeq!(ElementType!(TemplateArgsOf!(Args[0])[0]), extractType!(Args[1..$]));
+            }
+        }
+
+        alias colsT = genSeq!(Cols);
+        colsT columns;
+        alias readT = extractType!(colsT);
+
+        this(FileMeta meta, File f){
+            foreach(i, ref col; columns){
+                col = colsT[i](meta, f);
+            }
+        }
+
+        void getFields(ref readT fields){
+            foreach(i, ref field; fields){
+                field = columns[i].front;
+                columns[i].popFront();
+            }
+        }
+
+        int opApply(int delegate(readT) dg){
+            int result = 0;
+
+            import std.range;
+
+            readT fields;
+            for(getFields(fields); !columns[0].empty; getFields(fields)){
+                result = dg(fields);
+                if(result) break;
+            }
+        
+            return result;
+        }
+    }
+    unittest{
+        auto fn1 = getcwd() ~ "/source/tests/test3.cbam";
+        auto fn2 = getcwd() ~ "/source/tests/test1.bam";
+
+        File file = File(fn1, "r");
+        FileReader fileR = new FileReader(file);
+        BamReadBlobStream BAMreader = BamReadBlobStream(fn2);
+
+        auto test = VariadicReader!(bamFields.bin, bamFields.flag, bamFields.raw_qual)(fileR.fileMeta, file);
+        foreach(a, b, c; test){
+            auto temp = BAMreader.front();
+
+            assert(a==temp._bin);
+            assert(b==temp._flag);
+            assert(c==temp.raw_qual);
+            BAMreader.popFront();
+        }
+    }
+    
+    /// Get field specified by enum ColumnTypes. 
     auto getBaseColumn(ColumnTypes colType)(){
         static if(colType == ColumnTypes._refID ||
                   colType == ColumnTypes._pos   ||
@@ -135,53 +248,77 @@ class FileReader {
                   colType == ColumnTypes._next_refID ||
                   colType == ColumnTypes._next_pos ||
                   colType == ColumnTypes._tlen){
+                      // refID as a default field, simple plug
                     return new Column!(int[], bamFields.refID, colType)(fileMeta, file);
         }
-        else{
+        else{ // FIX: Passes the case when user sent wrong colType
             return new Column!(ubyte[][], bamFields.refID, colType)(fileMeta, file);
         }
     }
 
+    /**
+        Returns constructed Column struct for reading requested BAM field. 
+
+        Example:
+        ---
+        FileReader cbam_reader = new FileReader(file);
+
+        auto colRefID = cbam_reader.getColumn(bamFields.refID);
+        ---
+    */
     auto getColumn(bamFields bfield)(){
-        static if(bfield == bamFields.refID ||
-                  bfield == bamFields.pos   ||
-                  bfield == bamFields.nextRefID ||
-                  bfield == bamFields.nextPos ||
-                  bfield == bamFields.tlen ||
-                  bfield == bamFields.blob_size){
-                    return new Column!(int[], bfield)(fileMeta, file);
-                }
-        static if(bfield == bamFields.bin  ||
-                  bfield == bamFields.flag){
-                    return new Column!(short[], bfield)(fileMeta, file);
-                }
-        static if(bfield == bamFields.mapq)
-                    return new Column!(ubyte[], bfield)(fileMeta, file);
-        static if(bfield == bamFields.read_name ||
-                  bfield == bamFields.cigar     ||
-                  bfield == bamFields.raw_qual  ||
-                  bfield == bamFields.raw_sequence){
-                    return new Column!(ubyte[][], bfield)(fileMeta, file);
-                }
-        assert(0);
+        return getColType!(bfield).colT(fileMeta, file);
     }
 
+    /**
+        Column struct.
+
+        Gives access to CBAM columns.
+
+        Examples:
+        ---
+        
+        FileReader cbam_reader = new FileReader(file);
+
+        auto col = cbam_reader.getColumn(bamFields.refID);
+
+        /// Print refID of every BAM record
+        foreach(elem; col){
+            writeln(elem);
+        }
+
+        /// With index
+        foreach(i, elem; col){
+            writefln("%s: %s", i, elem);
+        }
+
+        /// Get array of refID of every BAM record
+        auto values = col.fullColumn();
+        
+        ---
+    */
     struct Column(T, bamFields bfield, ColumnTypes columnType = bamfToCbamf[bfield])
         if(is(T == ubyte[][]) || is(T == int[]) 
         || is(T == short[])   || is(T == ubyte[])) {
             
         this(FileMeta meta, File f){
+            enforce(f.isOpen());
             fileMeta = meta;
             buffer.length = fileMeta.rowGroups[0].num_rows;
             file = f;
+            enforce(buffer.length != 0, ("File is empty"));
+            rangeStatus = RangeStatus(meta.rowGroups);
+            fetchBuffer(fileMeta.rowGroups[0]);
+            popFront();
         }
 
+        /// Returns number of records in whole CBAM file
         public @property long size(){
             return reduce!((a,b) => a + b)(map!(row_group => row_group.num_rows)
                             (fileMeta.rowGroups));
         }
 
-        
+        /// Returns array representing whole CBAM column
         public T fullColumn(){
             T column;
             column.length = this.size;
@@ -193,6 +330,7 @@ class FileReader {
             return column;
         }
 
+        /// Parses value from byte buffer
         private static ElementType!T parse(ref byte[] bytes, ref long offset){
             // variable size fields require additional parsing step
             static if(is(ElementType!T==ubyte[])){
@@ -218,10 +356,30 @@ class FileReader {
             return value;
         }
         
+        @property ElementType!T front(){
+            return rangeStatus.frontElem;
+        }
+
+        @property bool empty(){
+            return rangeStatus.empty;
+        }
+
+        void popFront(){
+            enforce(!rangeStatus.empty);
+            
+            if(rangeStatus.bufOver){
+                rangeStatus.advance();
+                fetchBuffer(fileMeta.rowGroups[rangeStatus.rowGroupNum]);
+            }
+
+            rangeStatus.frontElem = buffer[rangeStatus.curElem];
+            rangeStatus.curElem++;
+        }
+
+        /// Iterates over CBAM column
         int opApply(int delegate(ElementType!T) dg){
             int result = 0;
             foreach(rowGroup; fileMeta.rowGroups){
-                buffer.length = rowGroup.num_rows;
                 fetchBuffer(rowGroup);
                 foreach(ref ElementType!T elem; buffer){
                     result = dg(elem);
@@ -232,12 +390,11 @@ class FileReader {
             return result;
         }
 
-        
+        /// Iterates over CBAM column with index
         int opApply(int delegate(ref size_t i, ElementType!T) dg){
             int result = 0;
             size_t i = 0;
             foreach(rowGroup; fileMeta.rowGroups){
-                buffer.length = rowGroup.num_rows;
                 fetchBuffer(rowGroup);
                 foreach(ElementType!T elem; buffer){
                     result = dg(i, elem);
@@ -250,6 +407,9 @@ class FileReader {
         }
 
         private void fetchBuffer(bool isRaw = false)(RowGroupMeta rowGroup){
+            enforce(file.isOpen());
+
+            buffer.length = rowGroup.num_rows;
             byte[] rawInputBuffer;
 
             ulong size = rowGroup.columnsSizes[columnType];
@@ -259,7 +419,7 @@ class FileReader {
             file.rawRead(rawInputBuffer);
             auto plainBuffer = Snappy.uncompress(rawInputBuffer);
 
-            static if(isRaw && !is(T==ubyte[][])){
+            static if(isRaw && !is (T==ubyte[][])){
                 rawBuffer = cast(ubyte[])plainBuffer;
             }
             else{
@@ -268,6 +428,7 @@ class FileReader {
                     elem = parse(plainBuffer, offset);
                 }
             }
+
         }
 
 
@@ -288,12 +449,39 @@ class FileReader {
                 return rawBuffer; 
             }
         }
+
+        string toString() {
+            return format("COLUMN TYPE   : %s\nCOLUMN bfield : %s\nCOLUMN colType: %s\nCOLUMN fileno : %s\n", 
+            typeid(buffer), to!string(bfield), to!string(columnType), file.fileno);
+        }
         
         private: 
             ubyte[] rawBuffer;
             T buffer;
+
+            struct RangeStatus{
+                this(RowGroupMeta[] groups){ 
+                    rowGroups = groups; 
+                    rowGroupNum = 0;
+                    curElem = 0;
+                }
+                RowGroupMeta[] rowGroups;
+                ElementType!T frontElem;
+                int rowGroupNum;
+                int curElem;
+                @property bool empty(){ return bufOver && exhausted; }
+                @property bool bufOver(){ return curElem == rowGroups[rowGroupNum].num_rows; }
+                @property bool exhausted(){ return rowGroupNum == rowGroups.length-1; }
+                void advance(){
+                    rowGroupNum++;
+                    curElem = 0;
+                }
+            }
+            RangeStatus rangeStatus;
+            
             FileMeta fileMeta;
-            File file;
+            public File file;
+            public int status;
     }
     
     unittest{
@@ -319,10 +507,16 @@ class FileReader {
         auto seqCol = CBAMseq.fullColumn();
         auto qualCol = CBAMqual.fullColumn();
 
+
         BamReadBlobStream reader = BamReadBlobStream(fn2);
         int i = 0;
+
+        auto rangeFlagCol = fileR.getColumn!(bamFields.flag);
         while(!reader.empty()){
             auto temp = reader.front();
+
+            assert(rangeFlagCol.front() == temp._flag);
+            if(!rangeFlagCol.empty) rangeFlagCol.popFront();
 
             assert(posCol[i] == temp.pos);
             assert(flagCol[i] == temp._flag);
