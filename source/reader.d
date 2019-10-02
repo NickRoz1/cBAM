@@ -422,11 +422,86 @@ class FileReader {
             static if(isRaw && !is (T==ubyte[][])){
                 rawBuffer = cast(ubyte[])plainBuffer;
             }
-            else{
-                long offset = 0;
-                foreach(i, ref elem; buffer){
-                    elem = parse(plainBuffer, offset);
+            else {
+
+                void fillBuffer(byte[] plainBuf, T buf)
+                {
+                    long offset = 0;
+                    foreach (i, ref elem; buf)
+                    {
+                        elem = parse(plainBuf, offset);
+                    }
                 }
+
+                struct inputWrapper
+                {
+                    byte[] bytes;
+                    long offset;
+                }
+
+                void fillIntegralBuffer(inputWrapper wrapper, shared(T) buf)
+                {
+                    import core.atomic : atomicStore;
+
+                    long offset = 0;
+                    while (offset < wrapper.bytes.length)
+                    {
+                        // atomicStore(buf[wrapper.offset++],
+                        //         cast(shared ElementType!T) parse(wrapper.bytes, offset));
+                        buf[wrapper.offset++] = cast(shared ElementType!T) parse(wrapper.bytes,
+                                offset);
+                    }
+                }
+
+                if (is(T == ubyte[][]))
+                    fillBuffer(plainBuffer, buffer);
+
+                else
+                {
+                    auto sw = StopWatch(AutoStart.no);
+                    sw.start();
+                    auto pool = new TaskPool();
+                    scope (exit)
+                        pool.finish();
+
+                    auto chunkSize = plainBuffer.length / pool.size();
+                    inputWrapper[] inputWrappers;
+                    if (chunkSize * pool.size() == plainBuffer.length && chunkSize % 64 == 0)
+                    {
+                        inputWrappers.length = pool.size();
+                    }
+                    else
+                    {
+                        inputWrappers.length = pool.size() + 1;
+                    }
+
+                    while (chunkSize % 64 != 0)
+                        chunkSize--;
+
+                    foreach (i, ref wrapper; inputWrappers)
+                    {
+                        wrapper.offset = i * chunkSize / 4; // fields size is 4
+                        size_t offset = i * chunkSize;
+
+                        if (offset + chunkSize > plainBuffer.length)
+                        {
+                            wrapper.bytes = plainBuffer[offset .. $];
+                        }
+                        else
+                        {
+                            wrapper.bytes = plainBuffer[offset .. offset + chunkSize];
+                        }
+                    }
+                    auto tempShared = cast(shared T) buffer;
+
+                    foreach (wrapper; parallel(inputWrappers))
+                    {
+                        fillIntegralBuffer(wrapper, tempShared);
+                    }
+                    sw.stop();
+                    //writeln("BUFFER FETCH ELAPSED: ", sw.peek.total!"msecs");
+                }
+
             }
 
         }
